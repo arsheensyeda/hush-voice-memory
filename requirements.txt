@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+requests
+qdrant-client
+fastembed
+python-dotenv
