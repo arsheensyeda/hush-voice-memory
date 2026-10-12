@@ -131,7 +131,15 @@ def run_agents(uid: str, question: str, context: list):
 app = FastAPI(title="Hush")
 
 
+from fastapi.responses import FileResponse
+
+
 @app.get("/")
+def home():
+    return FileResponse(os.path.join(os.path.dirname(__file__), "index.html"))
+
+
+@app.get("/health")
 def health():
     return {"status": "Hush is running"}
 
