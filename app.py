@@ -11,6 +11,8 @@ from qdrant_client.models import (Distance, FieldCondition, Filter, MatchValue,
 load_dotenv()
 LYZR_API_KEY = os.getenv("LYZR_API_KEY", "")
 LYZR_AGENT_ID = os.getenv("LYZR_AGENT_ID", "")
+LYZR_REVIEWER_AGENT_ID = os.getenv("LYZR_REVIEWER_AGENT_ID", "")
+LYZR_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 MEMORY = "hush_memory"
 AUDIT = "hush_audit"
 VISIBILITIES = ("private", "shared")
@@ -67,7 +69,7 @@ def remember(uid: str, text: str, source: str, visibility: str = "private") -> s
 
 
 def recall(uid: str, question: str, k: int = 5) -> list:
-    """Only SHARED memories can ever reach the agent."""
+    """Only SHARED memories can ever reach the agents."""
     hits = qdrant.query_points(
         MEMORY, query=embed(question),
         query_filter=uid_filter(uid, "shared"), limit=k).points
@@ -80,27 +82,50 @@ def check_owner(uid: str, pid: str):
         raise HTTPException(404, "Memory not found")
 
 
-# --- Lyzr, with Plan B fallback ---
-def ask_lyzr(uid: str, question: str, context: list):
+# --- Lyzr agents, with Plan B fallback ---
+def call_lyzr(uid: str, agent_id: str, message: str) -> str:
+    # Fresh session every call: if a memory is made private later,
+    # it can never linger in an old agent chat history.
+    r = requests.post(
+        LYZR_URL,
+        headers={"Content-Type": "application/json", "x-api-key": LYZR_API_KEY},
+        json={"user_id": uid, "agent_id": agent_id,
+              "session_id": f"{agent_id}-{uid}-{uuid.uuid4()}",
+              "message": message},
+        timeout=60)
+    r.raise_for_status()
+    return r.json().get("response", "")
+
+
+def run_agents(uid: str, question: str, context: list):
+    """Agent 1 drafts an answer, Agent 2 (Privacy Reviewer) checks it."""
+    steps = []
     if not context:
-        return "None of your shared memories answer this.", "no_context"
+        return "None of your shared memories answer this.", "no_context", steps
     if LYZR_API_KEY and LYZR_AGENT_ID:
+        ctx = "\n".join("- " + c for c in context)
+        base = f"CONTEXT:\n{ctx}\n\nQUESTION: {question}"
         try:
-            ctx = "\n".join("- " + c for c in context)
-            r = requests.post(
-                "https://agent-prod.studio.lyzr.ai/v3/inference/chat/",
-                headers={"Content-Type": "application/json", "x-api-key": LYZR_API_KEY},
-                json={"user_id": uid, "agent_id": LYZR_AGENT_ID,
-                      "session_id": f"{LYZR_AGENT_ID}-{uid}",
-                      "message": f"CONTEXT:\n{ctx}\n\nQUESTION: {question}"},
-                timeout=60)
-            r.raise_for_status()
-            return r.json().get("response", ""), "lyzr"
+            draft = call_lyzr(uid, LYZR_AGENT_ID, base)
+            steps.append({"agent": "answer_agent", "output": draft})
+            log(uid, "agent_answered", "answer agent done")
         except Exception as e:
-            log(uid, "lyzr_failed", type(e).__name__)
+            log(uid, "lyzr_failed", f"answer agent: {type(e).__name__}")
+            draft = None
+        if draft is not None:
+            if LYZR_REVIEWER_AGENT_ID:
+                try:
+                    final = call_lyzr(uid, LYZR_REVIEWER_AGENT_ID,
+                                      base + f"\n\nDRAFT ANSWER:\n{draft}")
+                    steps.append({"agent": "privacy_reviewer", "output": final})
+                    log(uid, "agent_reviewed", "privacy reviewer done")
+                    return final, "lyzr_multi_agent", steps
+                except Exception as e:
+                    log(uid, "lyzr_failed", f"reviewer: {type(e).__name__}")
+            return draft, "lyzr", steps
     # Plan B: no agent available, show the best-matching shared memories
     return ("Agent unavailable. Most relevant shared memories:\n- "
-            + "\n- ".join(context)), "fallback"
+            + "\n- ".join(context)), "fallback", steps
 
 
 app = FastAPI(title="Hush")
@@ -171,11 +196,11 @@ def ask(body: dict = Body(...)):
     withheld = qdrant.count(MEMORY, count_filter=uid_filter(uid, "private"),
                             exact=True).count
     log(uid, "memories_retrieved",
-        f"{len(context)} shared sent to agent, {withheld} private withheld")
-    answer, mode = ask_lyzr(uid, question, [c["text"] for c in context])
+        f"{len(context)} shared sent to agents, {withheld} private withheld")
+    answer, mode, steps = run_agents(uid, question, [c["text"] for c in context])
     log(uid, "answered", f"mode={mode}")
-    return {"answer": answer, "mode": mode, "shared_used": context,
-            "private_withheld": withheld}
+    return {"answer": answer, "mode": mode, "steps": steps,
+            "shared_used": context, "private_withheld": withheld}
 
 
 # --- Audit log ---
